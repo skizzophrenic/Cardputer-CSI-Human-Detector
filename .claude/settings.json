@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e sensor-s3 -t upload -d \"c:\\\\Users\\\\TalkingSasquach\\\\Desktop\\\\porkchop-radar-poc\\\\porkchop-radar-poc\\\\tools\\\\sensor_s3\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e cardputer-radar-wifi -t upload -d \"c:\\\\Users\\\\TalkingSasquach\\\\Desktop\\\\porkchop-radar-poc\\\\porkchop-radar-poc\")"
+    ]
+  }
+}
