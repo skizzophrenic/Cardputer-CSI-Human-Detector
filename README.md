@@ -1,12 +1,18 @@
 # Cardputer Human Detector
 
-A handheld WiFi-CSI people sensor built on the M5Stack Cardputer ADV. Uses Channel State Information (CSI) from the device's own WiFi traffic to detect presence and motion — no camera, no PIR, no dedicated RF hardware required.
+This tiny cyber deck is detecting people using Wi-Fi. No camera. No IR sensor. No thermal camera. Just Wi-Fi and this deeply cursed little radar screen.
+
+It uses Channel State Information (CSI) — the same Wi-Fi your router is already blasting everywhere — to detect when people are moving around. The human body is mostly water, and water messes with radio waves in very measurable ways. So we measure them.
+
+The whole build is around $50. Cardputer ADV is $30, grab [two of these TFT screens for $20](https://a.co/d/0bZbfTqO), find somebody with a 3D printer, and you've got yourself a handheld human radar that looks absolutely unhinged. I'm really, really happy with how this came out.
 
 ---
 
 ## How it works
 
-WiFi signals are perturbed by moving objects (including people). By reading the Channel State Information from received WiFi frames, the device detects changes in the RF environment caused by motion. The Cardputer measures CSI from its own WiFi association traffic and computes amplitude + phase variance as a real-time motion proxy.
+Wi-Fi signals bounce off everything in a room — walls, furniture, doors, your cat, and that weird little flesh bag you call your body. CSI data captures the *fingerprint* of those reflections. When something moves, that fingerprint changes. This firmware tracks those changes and uses them to detect presence and motion in real time.
+
+It runs entirely on the Cardputer ADV. No external sensor, no second device. The ESP32-S3 is dual-core, so one core handles the sensing while the other drives the screens. Everything is self-contained.
 
 ---
 
@@ -16,7 +22,9 @@ WiFi signals are perturbed by moving objects (including people). By reading the 
 |-------|------|
 | M5Stack Cardputer ADV (ESP32-S3 / StampS3) | Console UI + CSI sensor |
 
-**External display wiring (ILI9341 2.8" 320×240, SPI2):**
+**External display: [ILI9341 2.8" TFT (320×240)](https://a.co/d/0bZbfTqO)**
+
+Wire it up to the Cardputer ADV GPIO like this (SPI2, shared with SD):
 
 | Signal | Pin |
 |--------|-----|
@@ -26,26 +34,36 @@ WiFi signals are perturbed by moving objects (including people). By reading the 
 | MOSI | 14 |
 | SCK | 40 |
 
-Shared SPI bus with SD card (`bus_shared = true`), 27 MHz.
-
 ---
 
 ## Displays
 
-Two screens show different content simultaneously:
+Both screens are running at the same time showing different things — not a clone, actual different content:
 
-- **Top — External 2.8" ILI9341 (320×240):** PPI-style radar scope. Rotating sweep with phosphor trail. Motion above threshold paints contact blips; radius from RSSI, heat/size from motion intensity.
-- **Bottom — Built-in 1.14" (240×135):** WiFi IP, status pill, PRESENCE / CLEAR banner, scrolling motion graph, threshold value, key hints.
+- **Top — External 2.8" ILI9341 (320×240):** PPI-style radar scope. Rotating sweep with a phosphor trail. When motion crosses the threshold it paints contact blips — radius from RSSI, heat and size from motion intensity.
+- **Bottom — Built-in 1.14" (240×135):** WiFi IP, status pill, PRESENCE / CLEAR banner, scrolling motion graph, threshold value, and key hints.
 
 ---
 
-## Build & Flash
+## Flash the pre-built binary (easiest)
+
+Don't want to deal with PlatformIO? Grab the latest `.bin` from the [Releases page](../../releases) and flash it in your browser using [ESP Web Flasher](https://esptool.spacehuhn.com/):
+
+1. Plug in your Cardputer ADV via USB-C
+2. Go to [esptool.spacehuhn.com](https://esptool.spacehuhn.com/)
+3. Click **Connect** and select your device
+4. Upload the `.bin` from the latest release
+5. Done
+
+> **Note:** The pre-built binary has WiFi credentials baked in for my network, so it won't connect to yours out of the box. You'll want to build from source (below) with your own credentials to actually use the CSI sensing. The radar UI and screens will still work either way.
+
+---
+
+## Build from source
 
 Requires [PlatformIO](https://platformio.org/).
 
-### Credentials setup
-
-Copy the example credentials file and fill in your WiFi details:
+### 1. Set up your WiFi credentials
 
 ```sh
 cp credentials.ini.example credentials.ini
@@ -58,7 +76,7 @@ home_ssid = YourNetworkName
 home_pass = YourPassword
 ```
 
-### Flash
+### 2. Flash
 
 ```sh
 pio run -e cardputer-radar-csi -t upload
@@ -91,7 +109,7 @@ pio run -e cardputer-radar-csi -t upload
 
 ---
 
-## Constraints & notes
+## Dev notes
 
 - **No PSRAM** (StampS3). Sprites render at 240×180 and scale-to-fit via `pushRotateZoom`. Budget: two 240×180×16bpp canvases (~84 KB each).
 - `ARDUINO_USB_CDC_ON_BOOT=1` — `Serial` is the USB-C port.
@@ -104,3 +122,13 @@ pio run -e cardputer-radar-csi -t upload
 1. Calibration wizard with on-screen progress indicator
 2. Dual-antenna bearing estimation → directional blips on the radar scope
 3. Presence event log with optional SD card persistence
+
+---
+
+## The terrifying part
+
+There's almost nothing you can do to protect yourself from this. Wi-Fi goes through walls, floors, and pretty much anything else — because that's the whole point of Wi-Fi. This technology holds a ton of promise for things like elderly fall detection and hospital monitoring, but the privacy implications are real.
+
+I built this to show that you don't need a $60 billion government contract. You just need $50 and a little bit of tinkering time to build something that does what seemingly should be impossible.
+
+Are we okay with this? Drop a comment on the video and let me know.
