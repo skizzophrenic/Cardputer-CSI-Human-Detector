@@ -47,12 +47,6 @@ static char     wifiIP[16] = "---";
 #include "esp_wifi.h"
 static bool  wifiReady = false;
 static char  wifiIP[16] = "---";
-#ifndef HOME_SSID
-#define HOME_SSID "your_home_wifi"
-#endif
-#ifndef HOME_PASS
-#define HOME_PASS "your_home_pass"
-#endif
 
 static const int  kCsiWindow  = 50;
 static float      gCsiAmpBuf[kCsiWindow];
@@ -545,18 +539,21 @@ static void initCsi() {
     WiFi.mode(WIFI_STA);
     char savedSsid[64] = {}, savedPass[64] = {};
     bool hasSaved = loadWifiCreds(savedSsid, sizeof(savedSsid), savedPass, sizeof(savedPass));
-    const char* trySSID = hasSaved ? savedSsid : HOME_SSID;
-    const char* tryPass = hasSaved ? savedPass : HOME_PASS;
 
-    if (strlen(tryPass) > 0) WiFi.begin(trySSID, tryPass);
-    else WiFi.begin(trySSID);
+    if (!hasSaved) {
+        if (!runWifiPicker()) { delay(1000); ESP.restart(); }
+        return;
+    }
+
+    if (strlen(savedPass) > 0) WiFi.begin(savedSsid, savedPass);
+    else WiFi.begin(savedSsid);
 
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
         canvas.fillSprite(TFT_BLACK);
         canvas.setTextSize(1);
         canvas.setTextColor(gColB, TFT_BLACK);
-        char msg[48]; snprintf(msg, sizeof(msg), "Joining %s...", trySSID);
+        char msg[48]; snprintf(msg, sizeof(msg), "Joining %s...", savedSsid);
         canvas.drawString(msg, (canvas.width() - canvas.textWidth(msg)) / 2, canvas.height() / 2 - 4);
         canvas.pushSprite(0, 0);
         delay(200);
@@ -568,7 +565,7 @@ static void initCsi() {
     }
     strncpy(wifiIP, WiFi.localIP().toString().c_str(), sizeof(wifiIP) - 1);
     wifiReady = true;
-    Serial.printf("# CSI WiFi: %s  IP:%s\n", trySSID, wifiIP);
+    Serial.printf("# CSI WiFi: %s  IP:%s\n", savedSsid, wifiIP);
     enableCsi();
     Serial.println("# CSI active");
 }

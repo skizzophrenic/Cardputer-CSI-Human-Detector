@@ -21,14 +21,6 @@ jobs:
       - name: Install PlatformIO
         run: pip install platformio
 
-      - name: Write credentials
-        run: |
-          cat > credentials.ini << EOF
-          [credentials]
-          home_ssid = ${{ secrets.HOME_SSID }}
-          home_pass = ${{ secrets.HOME_PASS }}
-          EOF
-
       - name: Build firmware
         run: pio run -e cardputer-radar-csi
 

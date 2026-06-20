@@ -55,7 +55,7 @@ Don't want to deal with PlatformIO? Grab the latest `.bin` from the [Releases pa
 4. Upload the `.bin` from the latest release
 5. Done
 
-> **Note:** The pre-built binary has WiFi credentials baked in for my network, so it won't connect to yours out of the box. You'll want to build from source (below) with your own credentials to actually use the CSI sensing. The radar UI and screens will still work either way.
+On first boot it'll scan for networks, let you pick one, and ask for the password. Credentials get saved to the device so it won't ask again.
 
 ---
 
@@ -63,20 +63,7 @@ Don't want to deal with PlatformIO? Grab the latest `.bin` from the [Releases pa
 
 Requires [PlatformIO](https://platformio.org/).
 
-### 1. Set up your WiFi credentials
-
-```sh
-cp credentials.ini.example credentials.ini
-```
-
-Edit `credentials.ini`:
-```ini
-[credentials]
-home_ssid = YourNetworkName
-home_pass = YourPassword
-```
-
-### 2. Flash
+### Flash
 
 ```sh
 pio run -e cardputer-radar-csi -t upload
