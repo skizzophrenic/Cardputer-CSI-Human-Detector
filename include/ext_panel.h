@@ -84,6 +84,8 @@ public:
         }
         setPanel(&_panel_instance);
     }
+
+
 };
 
 #endif // PORK_EXT_PANEL_POC_H

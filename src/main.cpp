@@ -41,6 +41,104 @@ static char     wifiIP[16] = "---";
 #endif
 #endif
 
+// ── On-device CSI sensing ─────────────────────────────────────────────────────
+#if defined(RADAR_CSI)
+#include <WiFi.h>
+#include "esp_wifi.h"
+static bool  wifiReady = false;
+static char  wifiIP[16] = "---";
+#ifndef HOME_SSID
+#define HOME_SSID "your_home_wifi"
+#endif
+#ifndef HOME_PASS
+#define HOME_PASS "your_home_pass"
+#endif
+
+static const int  kCsiWindow  = 50;
+static float      gCsiAmpBuf[kCsiWindow];
+static float      gCsiPhaBuf[kCsiWindow];   // mean sin(phase) per frame
+static int        gCsiAmpIdx    = 0;
+static int        gCsiAmpFilled = 0;
+static volatile float    gCsiMotion  = 0.0f;
+static volatile int8_t   gCsiRssi    = -80;
+static volatile uint32_t gCsiCount   = 0;
+static float      gCsiVarMax   = 0.001f;
+static float      gCsiVarMin   = 0.0f;
+static float      gCsiPhaVarMax = 0.001f;
+static float      gCsiPhaVarMin = 0.0f;
+static const float kCsiThresh  = 0.15f;
+
+static void IRAM_ATTR promiscuousRxCb(void*, wifi_promiscuous_pkt_type_t) {}
+
+static void IRAM_ATTR csiCallback(void*, wifi_csi_info_t* info) {
+    if (!info || !info->buf || info->len < 4) return;
+    gCsiCount++;
+    int8_t* b   = info->buf;
+    int  nPairs = info->len / 2;
+
+    // Single pass: amplitude + mean sin(phase) = im/amp.
+    // Phase tracks slower/smaller motion that amplitude variance misses
+    // (similar to ruview's 40% amplitude / 30% phase weighting).
+    float ampSum = 0.0f, sinSum = 0.0f;
+    int   validPairs = 0;
+    for (int i = 0; i < nPairs; i++) {
+        float r  = (float)b[2*i];
+        float im = (float)b[2*i + 1];
+        float amp = sqrtf(r*r + im*im);
+        ampSum += amp;
+        if (amp > 1e-4f) { sinSum += im / amp; validPairs++; }
+    }
+    float meanAmp      = ampSum / (float)nPairs;
+    float meanSinPhase = validPairs > 0 ? sinSum / (float)validPairs : 0.0f;
+
+    gCsiAmpBuf[gCsiAmpIdx] = meanAmp;
+    gCsiPhaBuf[gCsiAmpIdx] = meanSinPhase;
+    gCsiAmpIdx = (gCsiAmpIdx + 1) % kCsiWindow;
+    if (gCsiAmpFilled < kCsiWindow) gCsiAmpFilled++;
+    int n = gCsiAmpFilled;
+
+    // Amplitude variance over window
+    float vsum = 0.0f;
+    for (int i = 0; i < n; i++) vsum += gCsiAmpBuf[i];
+    float vmean = vsum / (float)n;
+    float var   = 0.0f;
+    for (int i = 0; i < n; i++) { float d = gCsiAmpBuf[i] - vmean; var += d*d; }
+    var /= (float)n;
+
+    // Phase variance over window (variance of mean sin(phase))
+    float psum = 0.0f;
+    for (int i = 0; i < n; i++) psum += gCsiPhaBuf[i];
+    float pmean = psum / (float)n;
+    float pvar  = 0.0f;
+    for (int i = 0; i < n; i++) { float d = gCsiPhaBuf[i] - pmean; pvar += d*d; }
+    pvar /= (float)n;
+
+    // Normalize amplitude: asymmetric-EMA floor + running max → [0,1]
+    if (gCsiVarMin  < 0.0001f) gCsiVarMin  = var;
+    else gCsiVarMin  += (var  - gCsiVarMin)  * ((var  < gCsiVarMin)  ? 0.1f  : 0.002f);
+    if (var  > gCsiVarMax)  gCsiVarMax  = var;
+    else gCsiVarMax  += (var  - gCsiVarMax)  * 0.005f;
+    float range = gCsiVarMax - gCsiVarMin;
+    float ampMotion = (range > 0.0001f) ? ((var - gCsiVarMin) / range) : 0.0f;
+    if (ampMotion < 0.0f) ampMotion = 0.0f;
+    if (ampMotion > 1.0f) ampMotion = 1.0f;
+
+    // Normalize phase variance: same floor/max approach
+    if (gCsiPhaVarMin < 0.0001f) gCsiPhaVarMin = pvar;
+    else gCsiPhaVarMin += (pvar - gCsiPhaVarMin) * ((pvar < gCsiPhaVarMin) ? 0.1f : 0.002f);
+    if (pvar > gCsiPhaVarMax) gCsiPhaVarMax = pvar;
+    else gCsiPhaVarMax += (pvar - gCsiPhaVarMax) * 0.005f;
+    float prange = gCsiPhaVarMax - gCsiPhaVarMin;
+    float phaMotion = (prange > 0.0001f) ? ((pvar - gCsiPhaVarMin) / prange) : 0.0f;
+    if (phaMotion < 0.0f) phaMotion = 0.0f;
+    if (phaMotion > 1.0f) phaMotion = 1.0f;
+
+    // Blend: 60% amplitude, 40% phase (ruview weights: 40%/30%/30%)
+    gCsiMotion = 0.6f * ampMotion + 0.4f * phaMotion;
+    gCsiRssi   = info->rx_ctrl.rssi;
+}
+#endif
+
 static RadarLink       radar;
 
 static M5Canvas        canvas(&M5Cardputer.Display);   // bottom (built-in) buffer
@@ -82,7 +180,26 @@ static void applyPalette(uint8_t idx) {
 
 static void applyBrightness() {
     M5Cardputer.Display.setBrightness((uint8_t)((uint32_t)gBright * 255 / 100));
-    if (extReady) extPanel.setBrightness((uint8_t)((uint32_t)gExtBright * 255 / 100));
+    // EXT panel BL is wired to 5V (not a GPIO) — brightness handled in applyExtBrightness()
+}
+
+// Scale the topCanvas pixel buffer by gExtBright% before pushRotateZoom.
+// BL/LED on this module is wired to 5V (no GPIO control), so software dimming
+// is the only option. LovyanGFX SPI sprites store RGB565 big-endian (bytes
+// swapped), so bswap each pixel, scale R/G/B independently, then bswap back.
+static void applyExtBrightness() {
+    if (gExtBright >= 100) return;
+    uint16_t* buf = (uint16_t*)topCanvas.getBuffer();
+    if (!buf) return;
+    const uint32_t scale = (uint32_t)gExtBright * 256 / 100;
+    const int n = topCanvas.width() * topCanvas.height();
+    for (int i = 0; i < n; i++) {
+        uint16_t px = __builtin_bswap16(buf[i]);
+        uint8_t r = (((px >> 11) & 0x1F) * scale) >> 8;
+        uint8_t g = (((px >>  5) & 0x3F) * scale) >> 8;
+        uint8_t b = (( px        & 0x1F) * scale) >> 8;
+        buf[i] = __builtin_bswap16((r << 11) | (g << 5) | b);
+    }
 }
 
 static void saveSettings() {
@@ -138,6 +255,9 @@ static void serviceFake() {
   snprintf(line, sizeof(line), "R,%lu,%d,%.3f,%d,RUN",
            (unsigned long)(++seq), pres, mot, rssi);
   radar.injectLine(line);
+
+  // Keep the fake Ring camera blip alive for UI testing
+  camBlips[0].lastSeen = now;
 }
 #endif
 
@@ -211,6 +331,299 @@ static void serviceUDP() {
 }
 #endif
 
+// ── CSI WiFi init + service ────────────────────────────────────────────────────
+#if defined(RADAR_CSI)
+
+static bool loadWifiCreds(char* ssid, size_t sl, char* pass, size_t pl) {
+    Preferences p;
+    p.begin("wificreds", true);
+    bool ok = p.isKey("ssid");
+    if (ok) { p.getString("ssid", ssid, sl); p.getString("pass", pass, pl); }
+    p.end();
+    return ok && ssid[0] != '\0';
+}
+
+static void saveWifiCreds(const char* ssid, const char* pass) {
+    Preferences p;
+    p.begin("wificreds", false);
+    p.putString("ssid", ssid ? ssid : "");
+    p.putString("pass", pass ? pass : "");
+    p.end();
+}
+
+static void IRAM_ATTR sniffCallback(void*, wifi_promiscuous_pkt_type_t);  // defined later
+
+static void enableCsi() {
+    gCsiAmpIdx = 0; gCsiAmpFilled = 0;
+    gCsiVarMax = 0.001f; gCsiVarMin = 0.0f;
+    gCsiPhaVarMax = 0.001f; gCsiPhaVarMin = 0.0f;
+    memset(gCsiAmpBuf, 0, sizeof(gCsiAmpBuf));
+    memset(gCsiPhaBuf, 0, sizeof(gCsiPhaBuf));
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(promiscuousRxCb);
+    wifi_csi_config_t cfg = {};
+    cfg.lltf_en = true; cfg.htltf_en = true; cfg.stbc_htltf2_en = true;
+    cfg.ltf_merge_en = true; cfg.channel_filter_en = true;
+    cfg.manu_scale = false; cfg.shift = 0;
+    esp_wifi_set_csi_config(&cfg);
+    esp_wifi_set_csi_rx_cb(csiCallback, nullptr);
+    esp_wifi_set_csi(true);
+    wifi_promiscuous_filter_t pf{};
+    pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+    esp_wifi_set_promiscuous_filter(&pf);
+    esp_wifi_set_promiscuous_rx_cb(sniffCallback);
+}
+
+// Blocking WiFi picker UI. Returns true if connected on exit, false if cancelled.
+static bool runWifiPicker() {
+    const int W = canvas.width(), H = canvas.height();
+    const uint16_t cBg  = canvas.color565( 4,  0,  8);
+    const uint16_t cBar = canvas.color565(20,  0, 35);
+
+    // helpers ─────────────────────────────────────────────────────────────────
+    auto hdr = [&](const char* t) {
+        canvas.fillRect(0, 0, W, 14, cBar);
+        canvas.drawFastHLine(0, 13, W, gColA);
+        canvas.setTextSize(1); canvas.setTextColor(gColA, cBar);
+        canvas.drawString(t, (W - canvas.textWidth(t)) / 2, 3);
+    };
+    auto ftr = [&](const char* t) {
+        canvas.fillRect(0, H - 13, W, 13, cBar);
+        canvas.drawFastHLine(0, H - 13, W, gColA);
+        canvas.setTextSize(1); canvas.setTextColor(canvas.color565(70, 70, 70), cBar);
+        canvas.drawString(t, (W - canvas.textWidth(t)) / 2, H - 10);
+    };
+    // wait for a single keypress, return first char in word
+    auto waitKey = [&]() -> char {
+        for (;;) {
+            M5Cardputer.update();
+            if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+                auto w = M5Cardputer.Keyboard.keysState().word;
+                if (!w.empty()) return w[0];
+            }
+            delay(10);
+        }
+    };
+
+    // stop CSI + disconnect ───────────────────────────────────────────────────
+    if (wifiReady) {
+        esp_wifi_set_csi(false);
+        esp_wifi_set_promiscuous(false);
+        wifiReady = false;
+    }
+    WiFi.disconnect();
+    delay(300);
+    WiFi.mode(WIFI_STA);
+
+    // scan ────────────────────────────────────────────────────────────────────
+    int n = 0;
+    auto doScan = [&]() {
+        canvas.fillSprite(cBg); hdr(">> WIFI SELECT <<");
+        canvas.setTextSize(1); canvas.setTextColor(gColB, cBg);
+        const char* sm = "Scanning...";
+        canvas.drawString(sm, (W - canvas.textWidth(sm)) / 2, H / 2 - 4);
+        ftr(""); canvas.pushSprite(0, 0);
+        n = WiFi.scanNetworks();
+        if (n < 0) n = 0; if (n > 16) n = 16;
+    };
+    doScan();
+
+    // SSID list ───────────────────────────────────────────────────────────────
+    int cursor = 0, scroll = 0, pickedIdx = -1;
+    const int rowH = 14, visRows = (H - 29) / rowH;
+
+    while (pickedIdx < 0) {
+        canvas.fillSprite(cBg); hdr(">> WIFI SELECT <<");
+        if (n == 0) {
+            canvas.setTextSize(1); canvas.setTextColor(canvas.color565(80, 80, 80), cBg);
+            const char* nm = "No networks found";
+            canvas.drawString(nm, (W - canvas.textWidth(nm)) / 2, H / 2 - 4);
+            ftr("any key:rescan  `:cancel");
+        } else {
+            for (int vi = 0; vi < visRows; vi++) {
+                int ni = scroll + vi; if (ni >= n) break;
+                int y = 16 + vi * rowH; bool sel = (ni == cursor);
+                canvas.setTextColor(sel ? gColA : TFT_BLACK, cBg);
+                canvas.drawString(">", 3, y + 3);
+                char ssid[22]; strncpy(ssid, WiFi.SSID(ni).c_str(), sizeof(ssid) - 1); ssid[21] = '\0';
+                canvas.setTextColor(sel ? TFT_WHITE : canvas.color565(80, 80, 80), cBg);
+                canvas.drawString(ssid, 12, y + 3);
+                bool open = (WiFi.encryptionType(ni) == WIFI_AUTH_OPEN);
+                char rhs[10]; snprintf(rhs, sizeof(rhs), "%s%d", open ? "  " : "* ", WiFi.RSSI(ni));
+                canvas.setTextColor(sel ? gColB : canvas.color565(50, 50, 50), cBg);
+                canvas.drawString(rhs, W - canvas.textWidth(rhs) - 3, y + 3);
+            }
+            ftr(";/.:nav  /:select  `:cancel");
+        }
+        canvas.pushSprite(0, 0);
+
+        char c = waitKey();
+        if (c == '`') {
+            // cancel — restore previous connection if possible
+            char cs[64] = {}, cp[64] = {};
+            if (loadWifiCreds(cs, sizeof(cs), cp, sizeof(cp))) {
+                if (strlen(cp) > 0) WiFi.begin(cs, cp); else WiFi.begin(cs);
+                uint32_t t0 = millis();
+                while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(100);
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                strncpy(wifiIP, WiFi.localIP().toString().c_str(), sizeof(wifiIP) - 1);
+                wifiReady = true; enableCsi();
+            }
+            return wifiReady;
+        }
+        if (n == 0) {
+            doScan();
+        } else {
+            if      (c == ';') { if (cursor > 0) cursor--; }
+            else if (c == '.') { if (cursor < n - 1) cursor++; }
+            else if (c == '/') { pickedIdx = cursor; }
+            if (cursor < scroll) scroll = cursor;
+            if (cursor >= scroll + visRows) scroll = cursor - visRows + 1;
+        }
+    }
+
+    // password entry ──────────────────────────────────────────────────────────
+    char newSsid[64]; strncpy(newSsid, WiFi.SSID(pickedIdx).c_str(), sizeof(newSsid) - 1); newSsid[63] = '\0';
+    bool isOpen = (WiFi.encryptionType(pickedIdx) == WIFI_AUTH_OPEN);
+    char newPass[64] = {};
+
+    if (!isOpen) {
+        char cs[64] = {}, cp[64] = {};
+        if (loadWifiCreds(cs, sizeof(cs), cp, sizeof(cp)) && strcmp(cs, newSsid) == 0)
+            strncpy(newPass, cp, sizeof(newPass) - 1);
+
+        for (;;) {
+            canvas.fillSprite(cBg);
+            char h[30]; snprintf(h, sizeof(h), "PWD: %.18s", newSsid); hdr(h);
+            int pl = (int)strlen(newPass);
+            char stars[65]; memset(stars, '*', pl); stars[pl] = '\0';
+            char field[70]; snprintf(field, sizeof(field), "> %s_", stars);
+            canvas.setTextSize(1); canvas.setTextColor(TFT_WHITE, cBg);
+            canvas.drawString(field, 8, H / 2 - 6);
+            ftr("type pwd  /:confirm  `:cancel"); canvas.pushSprite(0, 0);
+
+            char c = waitKey();
+            if (c == '/') break;
+            if (c == '`') return false;
+            if (c == '\b' || c == 0x7f || c == 8) {
+                int l = (int)strlen(newPass); if (l > 0) newPass[l - 1] = '\0';
+            } else if (c >= 0x20 && c <= 0x7e) {
+                int l = (int)strlen(newPass); if (l < 63) { newPass[l] = c; newPass[l + 1] = '\0'; }
+            }
+        }
+    }
+
+    // connect ─────────────────────────────────────────────────────────────────
+    canvas.fillSprite(cBg); hdr(">> CONNECTING <<");
+    char cm[48]; snprintf(cm, sizeof(cm), "Joining %s...", newSsid);
+    canvas.setTextSize(1); canvas.setTextColor(gColB, cBg);
+    canvas.drawString(cm, (W - canvas.textWidth(cm)) / 2, H / 2 - 4); canvas.pushSprite(0, 0);
+
+    if (isOpen || strlen(newPass) == 0) WiFi.begin(newSsid);
+    else WiFi.begin(newSsid, newPass);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
+
+    canvas.fillSprite(cBg);
+    if (WiFi.status() == WL_CONNECTED) {
+        strncpy(wifiIP, WiFi.localIP().toString().c_str(), sizeof(wifiIP) - 1);
+        wifiReady = true; saveWifiCreds(newSsid, newPass); enableCsi();
+        char sm[48]; snprintf(sm, sizeof(sm), "OK: %s", wifiIP);
+        canvas.setTextSize(1); canvas.setTextColor(canvas.color565(0, 220, 80), cBg);
+        canvas.drawString(sm, (W - canvas.textWidth(sm)) / 2, H / 2 - 4);
+    } else {
+        canvas.setTextSize(1); canvas.setTextColor(TFT_RED, cBg);
+        const char* fm = "Connection failed!";
+        canvas.drawString(fm, (W - canvas.textWidth(fm)) / 2, H / 2 - 4);
+    }
+    canvas.pushSprite(0, 0); delay(1500);
+    return wifiReady;
+}
+
+static void initCsi() {
+    WiFi.mode(WIFI_STA);
+    char savedSsid[64] = {}, savedPass[64] = {};
+    bool hasSaved = loadWifiCreds(savedSsid, sizeof(savedSsid), savedPass, sizeof(savedPass));
+    const char* trySSID = hasSaved ? savedSsid : HOME_SSID;
+    const char* tryPass = hasSaved ? savedPass : HOME_PASS;
+
+    if (strlen(tryPass) > 0) WiFi.begin(trySSID, tryPass);
+    else WiFi.begin(trySSID);
+
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+        canvas.fillSprite(TFT_BLACK);
+        canvas.setTextSize(1);
+        canvas.setTextColor(gColB, TFT_BLACK);
+        char msg[48]; snprintf(msg, sizeof(msg), "Joining %s...", trySSID);
+        canvas.drawString(msg, (canvas.width() - canvas.textWidth(msg)) / 2, canvas.height() / 2 - 4);
+        canvas.pushSprite(0, 0);
+        delay(200);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect(); delay(500);
+        if (!runWifiPicker()) { delay(1000); ESP.restart(); }
+        return;
+    }
+    strncpy(wifiIP, WiFi.localIP().toString().c_str(), sizeof(wifiIP) - 1);
+    wifiReady = true;
+    Serial.printf("# CSI WiFi: %s  IP:%s\n", trySSID, wifiIP);
+    enableCsi();
+    Serial.println("# CSI active");
+}
+
+static void serviceCsi() {
+    static uint32_t seq        = 0;
+    static uint32_t last       = 0;
+    static int      holdCnt    = 0;
+    static float    heldMotion = 0.0f;
+    const  int      kHold      = 150;   // 10 s at 15 Hz
+
+    uint32_t now = millis();
+    if (now - last < 66) return;
+    last = now;
+
+    if (!wifiReady || WiFi.status() != WL_CONNECTED) {
+        if (wifiReady) {
+            // WiFi just dropped — stop CSI and clear frozen state
+            wifiReady  = false;
+            holdCnt    = 0;
+            heldMotion = 0.0f;
+            esp_wifi_set_csi(false);
+            esp_wifi_set_promiscuous(false);
+            gCsiMotion = 0.0f;
+        }
+        return;  // no frames injected → radar goes stale → NO LINK shown
+    }
+
+    // Hold/coast logic at known 15 Hz rate (CSI callback rate varies with traffic).
+    // Once motion is detected, presence coasts for ~10 s so a still person stays
+    // on the scope. Motion decays from its peak toward 10% so the blip fades
+    // gracefully rather than snapping off.
+    float m = gCsiMotion;
+    bool present;
+    if (m > kCsiThresh) {
+        holdCnt    = kHold;
+        heldMotion = m;
+        present    = true;
+    } else if (holdCnt > 0) {
+        holdCnt--;
+        float fade = (float)holdCnt / kHold;
+        m       = heldMotion * (0.10f + 0.90f * fade);
+        present = true;
+    } else {
+        present = false;
+        m       = 0.0f;
+    }
+
+    char line[48];
+    snprintf(line, sizeof(line), "R,%lu,%d,%.3f,%d,RUN",
+             (unsigned long)(++seq), (int)present, m, (int)gCsiRssi);
+    radar.injectLine(line);
+}
+#endif
+
 // --------------------------------------------------------------------------
 // In-app settings menu (ESC to open/close)
 // --------------------------------------------------------------------------
@@ -224,10 +637,16 @@ static void menuAdjust(int dir) {
             gBright = (uint8_t)constrain((int)gBright + (dir > 0 ? 10 : -10), 10, 100);
             M5Cardputer.Display.setBrightness((uint8_t)((uint32_t)gBright * 255 / 100));
             break;
-        default:
+        case 2:
             gExtBright = (uint8_t)constrain((int)gExtBright + (dir > 0 ? 10 : -10), 10, 100);
-            if (extReady) extPanel.setBrightness((uint8_t)((uint32_t)gExtBright * 255 / 100));
             break;
+#if defined(RADAR_CSI)
+        case 3:
+            gMenuOpen = false;
+            runWifiPicker();
+            break;
+#endif
+        default: break;
     }
 }
 
@@ -249,33 +668,42 @@ static void drawMenu() {
     canvas.drawString(hdr, (W - canvas.textWidth(hdr)) / 2, 3);
 
     // menu rows
-    static const char* labels[] = { "PALETTE", "SCREEN", "EXT PANEL" };
-    for (int i = 0; i < 3; i++) {
-        int  y   = 16 + i * 24;
+#if defined(RADAR_CSI)
+    const char* const labels[] = { "PALETTE", "SCREEN", "EXT PANEL", "WIFI NET" };
+    const int numItems = 4, rowH = 20, textOff = 6;
+#else
+    const char* const labels[] = { "PALETTE", "SCREEN", "EXT PANEL" };
+    const int numItems = 3, rowH = 24, textOff = 8;
+#endif
+    for (int i = 0; i < numItems; i++) {
+        int  y   = 16 + i * rowH;
         bool sel = (i == (int)gMenuCursor);
 
         canvas.setTextColor(sel ? gColA : TFT_BLACK, cBg);
-        canvas.drawString(">", 4, y + 8);
+        canvas.drawString(">", 4, y + textOff);
 
         canvas.setTextColor(sel ? TFT_WHITE : cDim, cBg);
-        canvas.drawString(labels[i], 16, y + 8);
+        canvas.drawString(labels[i], 16, y + textOff);
 
         char val[20];
         switch (i) {
-            case 0:
-                snprintf(val, sizeof(val), "%s", kPalettes[gColorIdx].name);
+            case 0: snprintf(val, sizeof(val), "%s", kPalettes[gColorIdx].name); break;
+            case 1: snprintf(val, sizeof(val), "%d%%", (int)gBright); break;
+            case 2: snprintf(val, sizeof(val), "%d%%", (int)gExtBright); break;
+#if defined(RADAR_CSI)
+            case 3: {
+                String cur = WiFi.SSID();
+                if (cur.length() > 0) snprintf(val, sizeof(val), "%.12s", cur.c_str());
+                else strncpy(val, "> SCAN", sizeof(val));
                 break;
-            case 1:
-                snprintf(val, sizeof(val), "%d%%", (int)gBright);
-                break;
-            default:
-                snprintf(val, sizeof(val), "%d%%", (int)gExtBright);
-                break;
+            }
+#endif
+            default: val[0] = '\0'; break;
         }
         canvas.setTextColor(sel ? gColB : cDim, cBg);
-        canvas.drawString(val, W - canvas.textWidth(val) - 8, y + 8);
+        canvas.drawString(val, W - canvas.textWidth(val) - 8, y + textOff);
 
-        if (i < 2) canvas.drawFastHLine(8, y + 22, W - 16, cSep);
+        if (i < numItems - 1) canvas.drawFastHLine(8, y + rowH - 2, W - 16, cSep);
     }
 
     // footer
@@ -315,7 +743,7 @@ static void drawBottom() {
   canvas.setTextColor(cMag, cBar);
 #if RADAR_FAKE
   canvas.drawString("[ WiFi-CSI RADAR/FAKE ]", (W - canvas.textWidth("[ WiFi-CSI RADAR/FAKE ]")) / 2, 3);
-#elif defined(RADAR_UDP)
+#elif defined(RADAR_UDP) || defined(RADAR_CSI)
   {
     char udpTitle[32];
     if (wifiReady) snprintf(udpTitle, sizeof(udpTitle), "[WiFi %s]", wifiIP);
@@ -395,14 +823,113 @@ static void drawBottom() {
 // --------------------------------------------------------------------------
 struct Blip { float ang; float rad; float strength; uint32_t birth; bool active; };
 static Blip           blips[12];
-static uint32_t       lastSpawn    = 0;
+static uint32_t       lastSpawn     = 0;
 static float          gLastSpawnAng = 0.0f;  // reuse angle on respawn — no bearing, so don't jump
-static const uint32_t BLIP_LIFE = 8000;   // ms a contact persists
+static const uint32_t BLIP_LIFE = 15000;  // ms a contact persists
 struct Ripple { float ang; float rad; uint32_t birth; bool active; };
 static Ripple         ripples[6];
 static float          gBEAR = 0.0f;
 static float          gLastBrg  = 0.0f;
 static int            gViewMode = 0;   // 0 = PPI radar scope, 1 = 3-D raycaster
+
+// Returns an angle in [0, TAU) that avoids ±30° around 6 o'clock (π/2) and 12 o'clock (3π/2).
+// Blips spawned at these angles overlap the central ghost avatar in the raycaster view.
+// Maps a uniform random value to three valid arcs: [0,π/3] ∪ [2π/3,4π/3] ∪ [5π/3,2π]
+static float pickBlipAngle() {
+    const float TAU = 6.2831853f;
+    float r = ((float)random(0, 10000) / 10000.0f) * (TAU * 2.0f / 3.0f);
+    const float s1 = TAU / 6.0f;  // π/3
+    const float s2 = TAU / 3.0f;  // 2π/3
+    if      (r < s1)       return r;
+    else if (r < s1 + s2)  return r - s1 + TAU / 3.0f;
+    else                   return r - s1 - s2 + TAU * 5.0f / 6.0f;
+}
+
+// ── Spycam detection ──────────────────────────────────────────────────────────
+struct CamBlip {
+    uint8_t  mac3[3];   // last 3 MAC bytes — unique enough for tracking
+    float    ang;       // assigned once at first detection, never updated
+    float    rad;       // RSSI → radius, EMA-smoothed
+    int8_t   rssi;
+    uint32_t lastSeen;
+    bool     active;
+    char     vendor[8];
+};
+static CamBlip        camBlips[8];
+static const uint32_t CAM_LIFE = 60000;  // ms before expiry if silent
+
+struct OuiEntry { uint8_t b[3]; const char* name; };
+static const OuiEntry kCamOuis[] = {
+    {{0x24,0x0A,0xC4},"ESP32"},  {{0x30,0xAE,0xA4},"ESP32"},
+    {{0x24,0x6F,0x28},"ESP32"},  {{0xDC,0x54,0x75},"ESP32"},
+    {{0xE8,0x9F,0x6D},"ESP32"},  {{0x8C,0xAA,0xB5},"ESP-S3"},
+    {{0x34,0x85,0x18},"ESP-S3"}, {{0x2C,0xAA,0x8E},"Wyze"},
+    {{0xD0,0x3F,0x27},"Wyze"},   {{0x7C,0x78,0xB2},"Wyze"},
+    {{0xFC,0x65,0xDE},"Ring"},   {{0x68,0x37,0xE9},"Ring"},
+    {{0x34,0xD2,0x70},"Amazon"}, {{0xF0,0x27,0x2D},"Hikvsn"},
+    {{0xC0,0x56,0xE3},"Hikvsn"}, {{0x44,0x19,0xB6},"Hikvsn"},
+    {{0x28,0x57,0xBE},"Reolnk"}, {{0x00,0xE0,0x4C},"Rltk"},
+    {{0xBC,0xDD,0xC2},"Arlo"},   {{0x4C,0x69,0x05},"Blink"},
+};
+static const int kNumCamOuis = (int)(sizeof(kCamOuis) / sizeof(kCamOuis[0]));
+
+#if defined(RADAR_CSI)
+static volatile uint8_t  gSniffMAC[6];
+static volatile int8_t   gSniffRssi    = 0;
+static volatile int      gSniffVendor  = 0;
+static volatile bool     gSniffPending = false;
+
+static void IRAM_ATTR sniffCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (gSniffPending) return;
+    const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
+    if (pkt->rx_ctrl.sig_len < 16) return;
+    const uint8_t* src = pkt->payload + 10;  // Address 2 = source MAC in all common frame types
+    for (int i = 0; i < kNumCamOuis; i++) {
+        if (src[0]==kCamOuis[i].b[0] && src[1]==kCamOuis[i].b[1] && src[2]==kCamOuis[i].b[2]) {
+            gSniffMAC[0]=src[0]; gSniffMAC[1]=src[1]; gSniffMAC[2]=src[2];
+            gSniffMAC[3]=src[3]; gSniffMAC[4]=src[4]; gSniffMAC[5]=src[5];
+            gSniffRssi   = pkt->rx_ctrl.rssi;
+            gSniffVendor = i;
+            gSniffPending = true;
+            return;
+        }
+    }
+}
+
+static void serviceCam() {
+    if (!gSniffPending) return;
+    gSniffPending = false;
+    uint8_t mac[6]; memcpy(mac, (void*)gSniffMAC, 6);
+    const int8_t   rssi      = gSniffRssi;
+    const int      vendorIdx = gSniffVendor;
+    const uint32_t now       = millis();
+    float t = ((float)rssi + 45.0f) / (-33.0f);
+    if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+    const float targetRad = 74.0f * (0.30f + t * 0.60f);
+    for (int i = 0; i < 8; i++) {
+        if (!camBlips[i].active) continue;
+        if (camBlips[i].mac3[0]==mac[3] && camBlips[i].mac3[1]==mac[4] && camBlips[i].mac3[2]==mac[5]) {
+            camBlips[i].rssi     = rssi;
+            camBlips[i].lastSeen = now;
+            camBlips[i].rad     += (targetRad - camBlips[i].rad) * 0.05f;
+            return;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < 8; i++) {
+        if (!camBlips[i].active || now - camBlips[i].lastSeen > CAM_LIFE) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    camBlips[slot].mac3[0] = mac[3]; camBlips[slot].mac3[1] = mac[4]; camBlips[slot].mac3[2] = mac[5];
+    camBlips[slot].ang      = pickBlipAngle();
+    camBlips[slot].rad      = targetRad;
+    camBlips[slot].rssi     = rssi;
+    camBlips[slot].lastSeen = now;
+    camBlips[slot].active   = true;
+    strncpy(camBlips[slot].vendor, kCamOuis[vendorIdx].name, 7);
+    camBlips[slot].vendor[7] = '\0';
+}
+#endif  // RADAR_CSI
 
 // Matrix rain — 7 columns in each side strip; scope disc + bars cover the middle
 static const uint8_t RAIN_X[14] = { 3,9,15,21,27,33,39, 201,207,213,219,225,231,237 };
@@ -509,6 +1036,17 @@ static void drawGhost(int cx, int cy, uint32_t now) {
   topCanvas.drawEllipse(cx, cy, 12, 15, topCanvas.color565(160, 160, 240));
 }
 
+// Amber camera icon: rectangular body + viewfinder notch + dark lens + glint.
+static void drawCamIcon(int cx, int cy) {
+    const uint16_t amber = topCanvas.color565(255, 190, 0);
+    const uint16_t dark  = topCanvas.color565(10, 10, 10);
+    topCanvas.fillRoundRect(cx - 6, cy - 3, 12, 7, 1, amber);
+    topCanvas.fillRect(cx - 2, cy - 5, 4, 2, amber);
+    topCanvas.drawCircle(cx, cy, 3, dark);
+    topCanvas.fillCircle(cx, cy, 2, dark);
+    topCanvas.drawPixel(cx + 1, cy - 1, topCanvas.color565(210, 210, 210));
+}
+
 static void drawRaycaster() {
   if (!extReady) return;
   const auto& s      = radar.state();
@@ -518,36 +1056,48 @@ static void drawRaycaster() {
   const int W = topCanvas.width(), H = topCanvas.height();
   const float TAU = 6.2831853f;
 
-  // ── SPAWN BLIPS (same stable-contact logic as drawTop) ───────────────────
+  // ── SPAWN / MERGE BLIPS ───────────────────────────────────────────────────
   if (present) {
     float rssiT = ((float)s.rssi + 45.0f) / (-33.0f);
     if (rssiT < 0.0f) rssiT = 0.0f; if (rssiT > 1.0f) rssiT = 1.0f;
-    int      newest   = -1;
-    uint32_t newest_t = 0;
+    float targetRad  = 74.0f * (0.25f + rssiT * 0.65f);
+    if (targetRad < 74.0f * 0.30f) targetRad = 74.0f * 0.30f;
+    const float mergeThresh = 74.0f * 0.20f;  // ~15 px ≈ a few feet of RSSI change
+
+    // Update all active blips; find the one closest to the current RSSI ring.
+    int   closestIdx  = -1;
+    float closestDist = 74.0f;
     for (int i = 0; i < 12; ++i) {
-      if (blips[i].active && blips[i].birth + BLIP_LIFE > now && blips[i].birth > newest_t) {
-        newest_t = blips[i].birth; newest = i;
-      }
+      if (!blips[i].active || blips[i].birth + BLIP_LIFE <= now) continue;
+      blips[i].strength += (s.motion - blips[i].strength) * 0.12f;
+      float d = fabsf(blips[i].rad - targetRad);
+      if (d < closestDist) { closestDist = d; closestIdx = i; }
     }
-    if (newest >= 0) {
-      blips[newest].birth     = now;
-      blips[newest].strength += (s.motion - blips[newest].strength) * 0.12f;
-      float targetRad = 74.0f * (0.25f + rssiT * 0.65f);
-      blips[newest].rad      += (targetRad - blips[newest].rad) * 0.08f;
-    } else if (now - lastSpawn > 300) {
+
+    if (closestIdx >= 0 && closestDist <= mergeThresh) {
+      // Same contact — refresh life and gently nudge toward current radius.
+      blips[closestIdx].birth  = now;
+      blips[closestIdx].rad   += (targetRad - blips[closestIdx].rad) * 0.05f;
+    } else if (now - lastSpawn > 800) {
+      // New or distinct position — spawn a separate dot.
       int slot = -1;
       for (int i = 0; i < 12; ++i) { if (!blips[i].active) { slot = i; break; } }
-      if (slot < 0) slot = 0;
-      gLastSpawnAng        = gLastSpawnAng > 0.0f ? gLastSpawnAng : ((float)random(0, 1000) / 1000.0f) * TAU;
-      blips[slot].ang      = gLastSpawnAng;
-      blips[slot].rad      = 74.0f * (0.25f + rssiT * 0.65f);
-      blips[slot].strength = s.motion;
-      blips[slot].birth    = now;
-      blips[slot].active   = true;
-      lastSpawn            = now;
-      gLastBrg  = fmodf((blips[slot].ang + TAU / 4.0f) * (360.0f / TAU) + 360.0f, 360.0f);
-      for (int r = 0; r < 6; ++r) {
-        if (!ripples[r].active) { ripples[r] = { blips[slot].ang, blips[slot].rad, now, true }; break; }
+      if (slot < 0) {
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < 12; ++i) if (blips[i].birth < oldest) { oldest = blips[i].birth; slot = i; }
+      }
+      if (slot >= 0) {
+        gLastSpawnAng = pickBlipAngle();
+        blips[slot].ang      = gLastSpawnAng;
+        blips[slot].rad      = targetRad;
+        blips[slot].strength = s.motion;
+        blips[slot].birth    = now;
+        blips[slot].active   = true;
+        lastSpawn            = now;
+        gLastBrg  = fmodf((gLastSpawnAng + TAU / 4.0f) * (360.0f / TAU) + 360.0f, 360.0f);
+        for (int r = 0; r < 6; ++r) {
+          if (!ripples[r].active) { ripples[r] = { gLastSpawnAng, targetRad, now, true }; break; }
+        }
       }
     }
   }
@@ -797,6 +1347,19 @@ static void drawRaycaster() {
     if (csx < W-1) topCanvas.drawPixel(csx + 1, csy, dimCol);
   }
 
+  // ── camera blip icons in 3-D view ────────────────────────────────────────
+  for (int i = 0; i < 8; i++) {
+    if (!camBlips[i].active) continue;
+    if (now - camBlips[i].lastSeen > CAM_LIFE) { camBlips[i].active = false; continue; }
+    float brgN  = camBlips[i].ang + TAU / 4.0f;
+    float distN = camBlips[i].rad / 74.0f;
+    int icsx = rCx + (int)(sinf(brgN) * distN * rH);
+    int icsy = rCy - (int)(cosf(brgN) * distN * rV);
+    if (icsy < horizY + 4 || icsy > sceneBot - 2) continue;
+    if (icsx < 8           || icsx > W - 8)        continue;
+    drawCamIcon(icsx, icsy - 7);  // slightly above floor = wall-mounted
+  }
+
   // ── TITLE BAR ────────────────────────────────────────────────────────────
   topCanvas.fillRect(0, 0, W, barH, cBar);
   topCanvas.drawFastHLine(0, barH - 1, W, cBorder);
@@ -805,8 +1368,13 @@ static void drawRaycaster() {
   topCanvas.setTextColor(cMag, cBar);
   topCanvas.drawString(title, (W - topCanvas.textWidth(title)) / 2, 3);
   drawBatIcon(topCanvas, 2, 3);
-  topCanvas.setTextColor(linkOk ? cCyan : TFT_RED, cBar);
+#if defined(RADAR_CSI)
+  const char* mStr = wifiReady ? "WiFi OK" : "No WiFi";
+  topCanvas.setTextColor(wifiReady ? topCanvas.color565(0, 210, 80) : TFT_RED, cBar);
+#else
   const char* mStr = linkOk ? s.mode : "NO LINK";
+  topCanvas.setTextColor(linkOk ? cCyan : TFT_RED, cBar);
+#endif
   topCanvas.drawString(mStr, W - topCanvas.textWidth(mStr) - 4, 3);
 
   // ── STATUS BAR ───────────────────────────────────────────────────────────
@@ -838,6 +1406,7 @@ static void drawRaycaster() {
   // ── GHOST — very last draw call, guaranteed on top of everything ──────────
   drawGhost(rCx, rCy - 5, now);
 
+  applyExtBrightness();
   topCanvas.pushRotateZoom(160, 120, 0.0f, EXT_ZOOM, EXT_ZOOM);
 }
 
@@ -871,39 +1440,48 @@ static void drawTop() {
   const float BEAR = 0.0f;
   gBEAR = BEAR;
 
-  // Stable contacts: while motion continues, refresh the existing blip in place
-  // (no position change). Only pick a new random position when all contacts have
-  // aged out — so each detection event appears as one stationary person on scope.
+  // Contacts: merge close blips (same person), spawn new ones for distinct rings.
   if (present) {
     float t = ((float)s.rssi + 45.0f) / (-33.0f);
     if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
-    int      newest  = -1;
-    uint32_t newest_t = 0;
+    float targetRad   = R * (0.25f + t * 0.65f);
+    if (targetRad < R * 0.30f) targetRad = R * 0.30f;
+    const float mergeThresh = R * 0.20f;  // ~15 px ≈ a few feet of RSSI change
+
+    // Update all active blips; find closest to the current RSSI ring.
+    int   closestIdx  = -1;
+    float closestDist = (float)R;
     for (int i = 0; i < 12; ++i) {
-      if (blips[i].active && blips[i].birth + BLIP_LIFE > now && blips[i].birth > newest_t) {
-        newest_t = blips[i].birth; newest = i;
-      }
+      if (!blips[i].active || blips[i].birth + BLIP_LIFE <= now) continue;
+      blips[i].strength += (s.motion - blips[i].strength) * 0.12f;
+      float d = fabsf(blips[i].rad - targetRad);
+      if (d < closestDist) { closestDist = d; closestIdx = i; }
     }
-    if (newest >= 0) {
-      blips[newest].birth     = now;
-      blips[newest].strength += (s.motion - blips[newest].strength) * 0.12f;
-      float targetRad = R * (0.25f + t * 0.65f);
-      blips[newest].rad      += (targetRad - blips[newest].rad) * 0.08f;
-    } else if (now - lastSpawn > 300) {
+
+    if (closestIdx >= 0 && closestDist <= mergeThresh) {
+      // Same contact — refresh life and gently nudge toward current radius.
+      blips[closestIdx].birth  = now;
+      blips[closestIdx].rad   += (targetRad - blips[closestIdx].rad) * 0.05f;
+    } else if (now - lastSpawn > 800) {
+      // New or distinct position — spawn a separate dot.
       int slot = -1;
       for (int i = 0; i < 12; ++i) { if (!blips[i].active) { slot = i; break; } }
-      if (slot < 0) slot = 0;
-      gLastSpawnAng        = gLastSpawnAng > 0.0f ? gLastSpawnAng : ((float)random(0, 1000) / 1000.0f) * TAU;
-      blips[slot].ang      = gLastSpawnAng;
-      blips[slot].rad      = R * (0.25f + t * 0.65f);
-      blips[slot].strength = s.motion;
-      blips[slot].birth    = now;
-      blips[slot].active   = true;
-      lastSpawn            = now;
-      gLastBrg = fmodf((blips[slot].ang + TAU / 4.0f) * (360.0f / TAU) + 360.0f, 360.0f);
-      // Immediate ping ripple so even a brief hit leaves an echo
-      for (int r = 0; r < 6; ++r) {
-        if (!ripples[r].active) { ripples[r] = { blips[slot].ang, blips[slot].rad, now, true }; break; }
+      if (slot < 0) {
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < 12; ++i) if (blips[i].birth < oldest) { oldest = blips[i].birth; slot = i; }
+      }
+      if (slot >= 0) {
+        gLastSpawnAng = pickBlipAngle();
+        blips[slot].ang      = gLastSpawnAng;
+        blips[slot].rad      = targetRad;
+        blips[slot].strength = s.motion;
+        blips[slot].birth    = now;
+        blips[slot].active   = true;
+        lastSpawn            = now;
+        gLastBrg = fmodf((gLastSpawnAng + TAU / 4.0f) * (360.0f / TAU) + 360.0f, 360.0f);
+        for (int r = 0; r < 6; ++r) {
+          if (!ripples[r].active) { ripples[r] = { gLastSpawnAng, targetRad, now, true }; break; }
+        }
       }
     }
   }
@@ -993,6 +1571,15 @@ static void drawTop() {
     if (fade > 0.6f) topCanvas.drawCircle(bx, by, sz + 2, col);
   }
 
+  // --- layer 4.5a: camera blip icons (amber, stationary) ---
+  for (int i = 0; i < 8; i++) {
+    if (!camBlips[i].active) continue;
+    if (now - camBlips[i].lastSeen > CAM_LIFE) { camBlips[i].active = false; continue; }
+    int bx = cx + (int)(camBlips[i].rad * cosf(camBlips[i].ang + BEAR));
+    int by = cy + (int)(camBlips[i].rad * sinf(camBlips[i].ang + BEAR));
+    drawCamIcon(bx, by);
+  }
+
   // --- layer 4.5: sonar ping ripples (white flash → cyan fade) ---
   for (int r = 0; r < 6; ++r) {
     if (!ripples[r].active) continue;
@@ -1020,8 +1607,13 @@ static void drawTop() {
   topCanvas.setTextColor(cMag, cBar);
   topCanvas.drawString(title, (W - topCanvas.textWidth(title)) / 2, 3);
   drawBatIcon(topCanvas, 2, 3);
+#if defined(RADAR_CSI)
+  const char* modeStr = wifiReady ? "WiFi OK" : "No WiFi";
+  topCanvas.setTextColor(wifiReady ? topCanvas.color565(0, 210, 80) : TFT_RED, cBar);
+#else
   const char* modeStr = !linkOk ? "NO LINK" : s.mode;
   topCanvas.setTextColor(!linkOk ? TFT_RED : cCyan, cBar);
+#endif
   topCanvas.drawString(modeStr, W - topCanvas.textWidth(modeStr) - 4, 3);
 
   // --- layer 7: status bar ---
@@ -1056,6 +1648,7 @@ static void drawTop() {
   topCanvas.fillRect(W-2, H-2, 2, 2, cCorner);
 
   // scale-to-fit onto the 320x240 TFT (240x180 * EXT_ZOOM = 320x240, no letterbox)
+  applyExtBrightness();
   topCanvas.pushRotateZoom(160, 120, 0.0f, EXT_ZOOM, EXT_ZOOM);
 }
 
@@ -1065,8 +1658,13 @@ static void serviceKeys() {
   auto st = M5Cardputer.Keyboard.keysState();
   for (char c : st.word) {
     if (gMenuOpen) {
+#if defined(RADAR_CSI)
+      if      (c == ';') gMenuCursor = (gMenuCursor + 3) % 4;
+      else if (c == '.') gMenuCursor = (gMenuCursor + 1) % 4;
+#else
       if      (c == ';') gMenuCursor = (gMenuCursor + 2) % 3;
       else if (c == '.') gMenuCursor = (gMenuCursor + 1) % 3;
+#endif
       else if (c == ',') menuAdjust(-1);
       else if (c == '/') menuAdjust(+1);
       else if (c == '`') {
@@ -1111,7 +1709,19 @@ void setup() {
   loadSettings();
   applyBrightness();
 
-#if defined(RADAR_UDP)
+#if RADAR_FAKE
+  camBlips[0].mac3[0] = 0x65; camBlips[0].mac3[1] = 0xDE; camBlips[0].mac3[2] = 0xAA;
+  camBlips[0].ang     = pickBlipAngle();
+  camBlips[0].rad     = 74.0f * 0.55f;
+  camBlips[0].rssi    = -65;
+  camBlips[0].lastSeen = millis();
+  camBlips[0].active  = true;
+  strncpy(camBlips[0].vendor, "Ring", 7);
+#endif
+
+#if defined(RADAR_CSI)
+  initCsi();
+#elif defined(RADAR_UDP)
   initWiFi();
 #elif !RADAR_FAKE
   radar.begin(Serial1, RADAR_RX_PIN, RADAR_TX_PIN, 115200);
@@ -1125,6 +1735,9 @@ void loop() {
 
 #if RADAR_FAKE
   serviceFake();
+#elif defined(RADAR_CSI)
+  serviceCsi();
+  serviceCam();
 #elif defined(RADAR_UDP)
   serviceUDP();
 #else
