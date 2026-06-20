@@ -19,7 +19,7 @@ jobs:
           key: pio-${{ hashFiles('platformio.ini') }}
 
       - name: Install PlatformIO
-        run: pip install platformio
+        run: pip install platformio esptool
 
       - name: Build firmware
         run: pio run -e cardputer-radar-csi
