@@ -2,7 +2,7 @@
 
 This tiny cyber deck is detecting people using Wi-Fi. No camera. No IR sensor. No thermal camera. Just Wi-Fi and this deeply cursed little radar screen.
 
-It uses Channel State Information (CSI) — the same Wi-Fi your router is already blasting everywhere — to detect when people are moving around. The human body is mostly water, and water messes with radio waves in very measurable ways. So we measure them.
+It uses Channel State Information (CSI), specifically the same Wi-Fi your router is already blasting everywhere, to detect when people are moving around. The human body is mostly water, and water messes with radio waves in very measurable ways. So we measure them.
 
 The whole build is around $50. Cardputer ADV is $30, grab [two of these TFT screens for $20](https://a.co/d/0bZbfTqO), find somebody with a 3D printer, and you've got yourself a handheld human radar that looks absolutely unhinged. I'm really, really happy with how this came out.
 
@@ -10,7 +10,7 @@ The whole build is around $50. Cardputer ADV is $30, grab [two of these TFT scre
 
 ## How it works
 
-Wi-Fi signals bounce off everything in a room — walls, furniture, doors, your cat, and that weird little flesh bag you call your body. CSI data captures the *fingerprint* of those reflections. When something moves, that fingerprint changes. This firmware tracks those changes and uses them to detect presence and motion in real time.
+Wi-Fi signals bounce off everything in a room: walls, furniture, doors, your cat, and that weird little flesh bag you call your body. CSI data captures the *fingerprint* of those reflections. When something moves, that fingerprint changes. This firmware tracks those changes and uses them to detect presence and motion in real time.
 
 It runs entirely on the Cardputer ADV. No external sensor, no second device. The ESP32-S3 is dual-core, so one core handles the sensing while the other drives the screens. Everything is self-contained.
 
@@ -38,10 +38,10 @@ Wire it up to the Cardputer ADV GPIO like this (SPI2, shared with SD):
 
 ## Displays
 
-Both screens are running at the same time showing different things — not a clone, actual different content:
+Both screens are running at the same time showing different things (not a clone, actual different content):
 
-- **Top — External 2.8" ILI9341 (320×240):** PPI-style radar scope. Rotating sweep with a phosphor trail. When motion crosses the threshold it paints contact blips — radius from RSSI, heat and size from motion intensity.
-- **Bottom — Built-in 1.14" (240×135):** WiFi IP, status pill, PRESENCE / CLEAR banner, scrolling motion graph, threshold value, and key hints.
+- **Top, External 2.8" ILI9341 (320×240):** PPI-style radar scope. Rotating sweep with a phosphor trail. When motion crosses the threshold it paints contact blips; radius from RSSI, heat and size from motion intensity.
+- **Bottom, Built-in 1.14" (240×135):** WiFi IP, status pill, PRESENCE / CLEAR banner, scrolling motion graph, threshold value, and key hints.
 
 ---
 
@@ -87,7 +87,6 @@ pio run -e cardputer-radar-csi -t upload
 ```
 ├── platformio.ini              Build config
 ├── partitions.csv              8MB dual-OTA partition table
-├── credentials.ini.example     WiFi credentials template (copy to credentials.ini)
 ├── include/
 │   ├── radar_link.h            Protocol parser, state, 240-sample motion history
 │   └── ext_panel.h             External ILI9341 panel driver
@@ -99,7 +98,7 @@ pio run -e cardputer-radar-csi -t upload
 ## Dev notes
 
 - **No PSRAM** (StampS3). Sprites render at 240×180 and scale-to-fit via `pushRotateZoom`. Budget: two 240×180×16bpp canvases (~84 KB each).
-- `ARDUINO_USB_CDC_ON_BOOT=1` — `Serial` is the USB-C port.
+- `ARDUINO_USB_CDC_ON_BOOT=1`: `Serial` is the USB-C port.
 - Platform: `espressif32@6.12.0`, board `m5stack-stamps3`, Arduino framework.
 
 ---
@@ -114,7 +113,7 @@ pio run -e cardputer-radar-csi -t upload
 
 ## The terrifying part
 
-There's almost nothing you can do to protect yourself from this. Wi-Fi goes through walls, floors, and pretty much anything else — because that's the whole point of Wi-Fi. This technology holds a ton of promise for things like elderly fall detection and hospital monitoring, but the privacy implications are real.
+There's almost nothing you can do to protect yourself from this. Wi-Fi goes through walls, floors, and pretty much anything else, because that's the whole point of Wi-Fi. This technology holds a ton of promise for things like elderly fall detection and hospital monitoring, but the privacy implications are real.
 
 I built this to show that you don't need a $60 billion government contract. You just need $50 and a little bit of tinkering time to build something that does what seemingly should be impossible.
 
