@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Write credentials
+        run: |
+          cat > credentials.ini << EOF
+          [credentials]
+          home_ssid = ${{ secrets.HOME_SSID }}
+          home_pass = ${{ secrets.HOME_PASS }}
+          EOF
+
+      - name: Build firmware
+        run: pio run -e cardputer-radar-csi
+
+      - name: Rename binary
+        run: cp .pio/build/cardputer-radar-csi/firmware.bin cardputer-csi-${{ github.ref_name }}.bin
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cardputer-csi-${{ github.ref_name }}.bin
+          generate_release_notes: true
