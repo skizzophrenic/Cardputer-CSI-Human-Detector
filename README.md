@@ -22,17 +22,7 @@ It runs entirely on the Cardputer ADV. No external sensor, no second device. The
 |-------|------|
 | M5Stack Cardputer ADV (ESP32-S3 / StampS3) | Console UI + CSI sensor |
 
-**External display: [ILI9341 2.8" TFT (320×240)](https://a.co/d/0bZbfTqO)**
-
-Wire it up to the Cardputer ADV GPIO like this (SPI2, shared with SD):
-
-| Signal | Pin |
-|--------|-----|
-| CS | 5 |
-| RST | 3 |
-| DC | 6 |
-| MOSI | 14 |
-| SCK | 40 |
+An external [ILI9341 TFT display](https://a.co/d/0bZbfTqO) is wired to the Cardputer ADV GPIO header for the radar scope screen.
 
 ---
 
@@ -40,8 +30,8 @@ Wire it up to the Cardputer ADV GPIO like this (SPI2, shared with SD):
 
 Both screens are running at the same time showing different things (not a clone, actual different content):
 
-- **Top, External 2.8" ILI9341 (320×240):** PPI-style radar scope. Rotating sweep with a phosphor trail. When motion crosses the threshold it paints contact blips; radius from RSSI, heat and size from motion intensity.
-- **Bottom, Built-in 1.14" (240×135):** WiFi IP, status pill, PRESENCE / CLEAR banner, scrolling motion graph, threshold value, and key hints.
+- **Top, external ILI9341:** PPI-style radar scope. Rotating sweep with a phosphor trail. When motion crosses the threshold it paints contact blips; radius from RSSI, heat and size from motion intensity.
+- **Bottom, built-in screen:** WiFi IP, status pill, PRESENCE / CLEAR banner, scrolling motion graph, threshold value, and key hints.
 
 ---
 
@@ -63,8 +53,6 @@ On first boot it'll scan for networks, let you pick one, and ask for the passwor
 
 Requires [PlatformIO](https://platformio.org/).
 
-### Flash
-
 ```sh
 pio run -e cardputer-radar-csi -t upload
 ```
@@ -85,19 +73,18 @@ pio run -e cardputer-radar-csi -t upload
 ## Project structure
 
 ```
-├── platformio.ini              Build config
-├── partitions.csv              8MB dual-OTA partition table
+├── platformio.ini          Build config
+├── partitions.csv          8MB dual-OTA partition table
 ├── include/
-│   ├── radar_link.h            Protocol parser, state, 240-sample motion history
-│   └── ext_panel.h             External ILI9341 panel driver
-└── src/main.cpp                Dual-screen radar UI, CSI callbacks, key handling
+│   ├── radar_link.h        Protocol parser, state, 240-sample motion history
+│   └── ext_panel.h         External ILI9341 panel driver
+└── src/main.cpp            Dual-screen radar UI, CSI callbacks, key handling
 ```
 
 ---
 
 ## Dev notes
 
-- **No PSRAM** (StampS3). Sprites render at 240×180 and scale-to-fit via `pushRotateZoom`. Budget: two 240×180×16bpp canvases (~84 KB each).
 - `ARDUINO_USB_CDC_ON_BOOT=1`: `Serial` is the USB-C port.
 - Platform: `espressif32@6.12.0`, board `m5stack-stamps3`, Arduino framework.
 
@@ -106,7 +93,7 @@ pio run -e cardputer-radar-csi -t upload
 ## Roadmap
 
 1. Calibration wizard with on-screen progress indicator
-2. Dual-antenna bearing estimation → directional blips on the radar scope
+2. Dual-antenna bearing estimation toward directional blips on the radar scope
 3. Presence event log with optional SD card persistence
 
 ---
