@@ -42,7 +42,7 @@ Don't want to deal with PlatformIO? Grab the latest `.bin` from the [Releases pa
 1. Plug in your Cardputer ADV via USB-C
 2. Go to [esptool.spacehuhn.com](https://esptool.spacehuhn.com/)
 3. Click **Connect** and select your device
-4. Upload the `.bin` from the latest release
+4. Upload the `.bin` from the latest release at address `0x0`
 5. Done
 
 On first boot it'll scan for networks, let you pick one, and ask for the password. Credentials get saved to the device so it won't ask again.
